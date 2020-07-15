@@ -1,0 +1,269 @@
+import os, sys, csv, json, re, datetime, getopt
+
+DATA_FOLDER         = 'data/'
+FREQUENCY_FILE      = '/frequencies.csv'
+HEADER_FILE		    = '/header.json'
+TIMETABLE_FILE      = '/timetable.json'
+
+CSV_IDX_REF                    = 0
+CSV_IDX_FROM                   = 1
+CSV_IDX_TO                     = 2
+CSV_IDX_VIA                    = 3
+CSV_IDX_INTERMEDIATES          = 4
+CSV_IDX_HOURS                  = 5
+CSV_IDX_EXCEPTIONS             = 6
+CSV_IDX_DURATION               = 7
+CSV_IDX_INTERMEDIATE_DURATIONS = 8
+CSV_IDX_FREQUENCY              = 9
+
+MODE_PER_HOUR		= False
+
+def main(argv):
+    global MODE_PER_HOUR
+    
+    folder = ''
+
+    try:
+        (opts, args) = getopt.getopt(argv,"f:h",["folder=","per_hour"])
+    except getopt.GetoptError:
+        sys.stderr.write('convert.py -f | --folder <folder> [-h | --per_hour]\n')
+        sys.exit(2)
+    for (opt, arg) in opts:
+        if opt in ('-f', '--folder'):
+            folder = arg
+            if not os.path.exists(DATA_FOLDER+folder):
+                sys.stderr.write("Error: No folder found at '%s'.\n" % (DATA_FOLDER+folder))
+                sys.exit(0)
+        elif opt in ('-h','--per_hour'):
+            MODE_PER_HOUR = True
+    
+    if folder == '':
+        sys.stderr.write("Error: You have to specify a folder name.\n")
+        sys.stderr.write('convert.py -f|--folder <folder> [-h|--per_hour]\n')
+        sys.stderr.write('Example: python3 convert.py -f \'example\'\n')
+        sys.exit(2)
+    
+    frequency_file = DATA_FOLDER+folder+FREQUENCY_FILE
+    
+    if os.path.exists(frequency_file):
+        try:
+            with open(frequency_file, newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                input_data = list(reader)
+
+        except ValueError as e:
+            sys.stderr.write("Error: I got a problem reading your csv at '%s'. Is it in a good format?\n" % frequency_file)
+            print(e)
+            sys.exit(0)
+    else:
+        sys.stderr.write("Error: No input csv file found at '%s'.\n" % frequency_file)
+        sys.exit(0)
+
+    header_file = DATA_FOLDER+folder+HEADER_FILE
+    header_data = None
+    
+    if os.path.exists(header_file):
+        try:
+            with open(header_file, newline='', encoding='utf-8') as f:
+                header_data = json.load(f)
+
+        except json.JSONDecodeError as e:
+            sys.stderr.write("Error: I got a problem reading your header json at '%s'. Is it in a good format?\n" % header_file)
+            print(e)
+            sys.exit(0)
+    else:
+        sys.stderr.write("Warning: No header json file found at '%s'.\nYou HAVE TO add it later manually.\n" % header_file)
+
+
+    output = generate_json(input_data, header_data)
+
+    with open(DATA_FOLDER+folder+TIMETABLE_FILE, 'w', encoding='utf8') as outfile:
+        json.dump(output, outfile, sort_keys=True, indent=4, ensure_ascii=False)
+
+    sys.exit()  #end program
+
+def generate_json(input_data, header_data):
+    
+    output = {}
+    header_line = True
+    
+    if header_data is not None:
+        recommended_header_keys = ['start_date','end_date']
+        for key in recommended_header_keys:
+            if key in header_data:
+                output[key] = header_data[key]
+            else:
+                sys.stderr.write("Warning: The header json file lacks the key '%s'.\nYou are recommended to add it later manually.\n" % key)
+
+        optional_header_keys = ['excluded_lines','included_lines']
+        for key in optional_header_keys:
+            if key in header_data:
+                output[key] = header_data[key]
+            else:
+                sys.stderr.write("Warning: The header json file lacks the key '%s'.\nYou can optionally add it later manually.\n" % key)
+
+
+
+    output['updated'] = datetime.date.today().isoformat()
+    output['lines'] = {}
+
+    for data in input_data:
+
+        if header_line is True:
+            header_line = False
+            continue
+
+        ref = data[CSV_IDX_REF]
+        if ref not in output["lines"]:
+            output["lines"][ref] = []
+        fr = data[CSV_IDX_FROM]
+        to = data[CSV_IDX_TO]
+        via = data[CSV_IDX_VIA]
+        
+        intermediates = data[CSV_IDX_INTERMEDIATES].split(";")
+        if len(intermediates) == 1 and intermediates[0] == '':
+            intermediates = []
+        intermediate_durations = data[CSV_IDX_INTERMEDIATE_DURATIONS].split(";")
+        if len(intermediate_durations) == 1 and intermediate_durations[0] == '':
+            intermediate_durations = []
+            
+        if len(intermediates) != len(intermediate_durations):
+            sys.stderr.write("Error: For ref=%s, from='%s', to='%s', via='%s', there weren't the same number of intermediate stops and intermediate times.\nSkipping this line, please check your frequencies.csv.\n" % (ref,fr,to,via))
+            continue
+        
+        exceptions = data[CSV_IDX_EXCEPTIONS].split(";")
+        if len(exceptions) == 1 and exceptions[0] == '':
+            exceptions = []
+
+        frequency = data[CSV_IDX_FREQUENCY]
+        if len(frequency) == 0:
+            frequency = 0
+        else:
+            frequency = float(frequency)
+
+        # Prepare schedule
+        opening_weekdays_and_hours = data[CSV_IDX_HOURS].split(";")
+        opening_services = {}
+
+        for i, d in enumerate(opening_weekdays_and_hours):
+
+            (opening_service, opening_hours) = opening_weekdays_and_hours[i].strip().split(' ')
+
+            opening_hours = opening_hours.split('|')
+
+            if opening_service not in opening_services:
+                opening_services[opening_service] = []
+
+            for opening_hour in opening_hours:
+                opening_services[opening_service].append(opening_hour)
+            
+        for opening_service in opening_services.keys():
+            service = {
+                "from": fr,
+                "to": to,
+                "services": [opening_service],
+                "exceptions": exceptions,
+                "times": []
+            }
+            
+            if len(via) > 0:
+                service["via"] = via
+
+            if len(intermediates) > 0:
+                stations = list()
+                stations.append(fr)
+                stations.extend(intermediates)
+                stations.append(to)
+                service["stations"] = stations
+            else:
+                service["stations"] = [fr, to]
+            
+            for opening_hour in opening_services[opening_service]:
+                service["times"] += generate_times(opening_hour, int(data[CSV_IDX_DURATION]), intermediate_durations, frequency)
+            
+            output["lines"][ref].append(service)
+    
+    return output
+
+
+def generate_times(hour, duration, intermediate_durations, frequency):
+
+    data_index = int()
+    schedule = dict()
+    times = list()
+
+    regex = re.search(r"([0-9]+):([0-9]+)-([0-9]+):([0-9]+)" , hour)
+    if regex is not None:
+        (start_hour, start_min, end_hour, end_min) = regex.groups()
+    else:
+        regex = re.search(r"([0-9]+):([0-9]+)" , hour)
+        if regex is None:
+            sys.stderr.write("Error: Some format error in the opening_hours. Please check your frequencies.csv.\n")
+            sys.exit(0)
+        (start_hour, start_min) = regex.groups()
+        times.append(calculate_times(int(start_hour), int(start_min), duration, intermediate_durations))
+        return times
+
+    (start_hour, start_min, end_hour, end_min) = (int(start_hour), int(start_min), int(end_hour), int(end_min))
+
+    if frequency == 0:
+        sys.stderr.write("Error: You can not use a blank value or the value '0' for frequency if time ranges are given. Please check your frequencies.csv.\n")
+        sys.exit(0)
+    
+    if MODE_PER_HOUR:
+        minutes = 60 // frequency 
+    else:
+        minutes = frequency
+        
+    next_min = 0
+    current_hour = start_hour
+    
+    while current_hour <= end_hour:
+        
+        if current_hour == start_hour:
+            next_min = start_min
+        
+        until = 59
+        if current_hour == end_hour:
+            until = end_min
+
+        while next_min <= until:
+            times.append(calculate_times(current_hour, int(next_min), duration, intermediate_durations))
+            next_min = next_min + minutes
+        
+        
+        if current_hour == end_hour:
+            current_hour += 1
+        current_hour +=  (next_min // 60)
+        next_min = next_min % 60
+        
+    
+    return times
+
+def calculate_times(hour, start_time, duration, intermediate_durations):
+
+    calculated_time = list()
+
+    calculated_time.append(calculate_time(hour, start_time, 0))
+
+    for intermediate_duration in intermediate_durations:
+        calculated_time.append(calculate_time(hour, start_time, int(intermediate_duration)))
+
+    calculated_time.append(calculate_time(hour, start_time, duration))
+
+    return calculated_time
+
+def calculate_time(hour, start_time, duration):
+    end_time = start_time + duration
+    
+    if end_time >= 60:
+        hour = hour + (end_time // 60)
+        end_time = end_time % 60
+
+    return "%02d:%02d" % (hour,end_time)
+    
+
+if __name__ == "__main__":
+    if sys.version_info[0] < 3:
+        raise Exception("Python 3 or a more recent version is required.")
+    main(sys.argv[1:])
